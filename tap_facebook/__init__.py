@@ -22,6 +22,8 @@ from singer import (transform,
                     Transformer, _transform_datetime)
 from singer.catalog import Catalog, CatalogEntry
 
+from functools import partial
+
 from facebook_business import FacebookAdsApi
 import facebook_business.adobjects.adcreative as adcreative
 import facebook_business.adobjects.ad as fb_ad
@@ -33,6 +35,8 @@ import facebook_business.adobjects.user as fb_user
 from facebook_business.exceptions import FacebookRequestError
 
 TODAY = pendulum.today()
+
+API = None
 
 INSIGHTS_MAX_WAIT_TO_START_SECONDS = 2 * 60
 INSIGHTS_MAX_WAIT_TO_FINISH_SECONDS = 30 * 60
@@ -200,6 +204,25 @@ class IncrementalStream(Stream):
             if max_bookmark:
                 yield {'state': advance_bookmark(self, UPDATED_TIME_KEY, str(max_bookmark))}
 
+
+def ad_creative_success(response, stream=None):
+    '''A success callback for the FB Batch endpoint used when syncing AdCreatives. Needs the stream
+    to resolve schema refs and transform the successful response object.'''
+    refs = load_shared_schema_refs()
+    schema = singer.resolve_schema_references(stream.catalog_entry.schema.to_dict(), refs)
+
+    rec = response.json()
+    record = Transformer(pre_hook=transform_date_hook).transform(rec, schema)
+    singer.write_record(stream.name, record, stream.stream_alias, utils.now())
+
+
+def ad_creative_failure(response):
+    '''A failure callback for the FB Batch endpoint used when syncing AdCreatives. Raises the error
+    so it fails the sync process.'''
+    raise response.error()
+
+
+# AdCreative is not an interable stream as it uses the batch endpoint
 class AdCreative(Stream):
     '''
     doc: https://developers.facebook.com/docs/marketing-api/reference/adgroup/adcreatives/
@@ -208,14 +231,34 @@ class AdCreative(Stream):
     field_class = adcreative.AdCreative.Field
     key_properties = ['id']
 
-    def __iter__(self):
+
+    def sync(self):
         @retry_pattern(backoff.expo, FacebookRequestError, max_tries=5, factor=5)
         def do_request():
-            return self.account.get_ad_creatives(fields=self.fields(), # pylint: disable=no-member
-                                                 params={'limit': RESULT_RETURN_LIMIT})
+            return self.account.get_ad_creatives(params={'limit': RESULT_RETURN_LIMIT})
+
         ad_creative = do_request()
-        for a in ad_creative: # pylint: disable=invalid-name
-            yield {'record': a.export_all_data()}
+
+        # Create the initial batch
+        api_batch = API.new_batch()
+        batch_count = 0
+
+        # This loop syncs minimal AdCreative objects
+        for a in ad_creative:
+            # Excecute and create a new batch for every 50 added
+            if batch_count % 50 == 0:
+                api_batch.execute()
+                api_batch = API.new_batch()
+
+            # Add a call to the batch with the full object
+            a.api_get(fields=self.fields(),
+                      batch=api_batch,
+                      success=partial(ad_creative_success, stream=self),
+                      failure=ad_creative_failure)
+            batch_count += 1
+
+        # Ensure the final batch is executed
+        api_batch.execute()
 
 
 class Ads(IncrementalStream):
@@ -247,7 +290,7 @@ class Ads(IncrementalStream):
 
         @retry_pattern(backoff.expo, FacebookRequestError, max_tries=5, factor=5)
         def prepare_record(ad):
-            return ad.remote_read(fields=self.fields()).export_all_data()
+            return ad.api_get(fields=self.fields()).export_all_data()
 
         if CONFIG.get('include_deleted', 'false').lower() == 'true':
             ads = do_request_multiple()
@@ -286,7 +329,7 @@ class AdSets(IncrementalStream):
 
         @retry_pattern(backoff.expo, FacebookRequestError, max_tries=5, factor=5)
         def prepare_record(ad_set):
-            return ad_set.remote_read(fields=self.fields()).export_all_data()
+            return ad_set.api_get(fields=self.fields()).export_all_data()
 
         if CONFIG.get('include_deleted', 'false').lower() == 'true':
             ad_sets = do_request_multiple()
@@ -326,7 +369,7 @@ class Campaigns(IncrementalStream):
 
         @retry_pattern(backoff.expo, FacebookRequestError, max_tries=5, factor=5)
         def prepare_record(campaign):
-            campaign_out = campaign.remote_read(fields=fields).export_all_data()
+            campaign_out = campaign.api_get(fields=fields).export_all_data()
             if pull_ads:
                 campaign_out['ads'] = {'data': []}
                 ids = [ad['id'] for ad in campaign.get_ads()]
@@ -459,7 +502,7 @@ class AdsInsights(Stream):
         sleep_time = 10
         while status != "Job Completed":
             duration = time.time() - time_start
-            job = job.remote_read()
+            job = job.api_get()
             status = job['async_status']
             percent_complete = job['async_percent_completion']
 
@@ -575,6 +618,12 @@ def do_sync(account, catalog, state):
         schema = singer.resolve_schema_references(load_schema(stream), refs)
         bookmark_key = BOOKMARK_KEYS.get(stream.name)
         singer.write_schema(stream.name, schema, stream.key_properties, bookmark_key, stream.stream_alias)
+
+        # NB: The AdCreative stream is not an iterator
+        if stream.name == 'adcreative':
+            stream.sync()
+            continue
+
         with Transformer(pre_hook=transform_date_hook) as transformer:
             with metrics.record_counter(stream.name) as counter:
                 for message in stream:
@@ -659,7 +708,11 @@ def main_impl():
 
     CONFIG.update(args.config)
 
-    FacebookAdsApi.init(access_token=access_token)
+    global RESULT_RETURN_LIMIT
+    RESULT_RETURN_LIMIT = CONFIG.get('result_return_limit', RESULT_RETURN_LIMIT)
+
+    global API
+    API = FacebookAdsApi.init(access_token=access_token)
     user = fb_user.User(fbid='me')
     accounts = user.get_ad_accounts()
     account = None
