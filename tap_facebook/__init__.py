@@ -489,6 +489,7 @@ class AdsInsights(Stream):
                 'fields': list(self.fields().difference(self.invalid_insights_fields)),
                 'time_increment': self.time_increment,
                 'action_attribution_windows': list(self.action_attribution_windows),
+                'action_report_time': 'impression',
                 'time_ranges': [{'since': buffered_start_date.to_date_string(),
                                  'until': buffered_start_date.to_date_string()}]
             }
